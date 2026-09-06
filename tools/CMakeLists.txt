@@ -1,0 +1,8 @@
+add_executable(tailctl tailctl.cpp)
+target_link_libraries(tailctl PRIVATE TailGovernor::tailgovernor)
+if(MSVC)
+    target_compile_options(tailctl PRIVATE /W4 /WX)
+else()
+    target_compile_options(tailctl PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME tg_cli COMMAND tailctl demo)

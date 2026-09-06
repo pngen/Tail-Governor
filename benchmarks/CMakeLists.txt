@@ -1,0 +1,7 @@
+add_executable(tg_bench bench.cpp)
+target_link_libraries(tg_bench PRIVATE TailGovernor::tailgovernor)
+if(MSVC)
+    target_compile_options(tg_bench PRIVATE /W4 /WX)
+else()
+    target_compile_options(tg_bench PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()

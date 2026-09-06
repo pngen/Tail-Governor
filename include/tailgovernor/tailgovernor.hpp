@@ -1,0 +1,16 @@
+#pragma once
+// Tail Governor - standalone public API.
+#include "tailgovernor/status.hpp"
+#include "tailgovernor/identity.hpp"
+#include "tailgovernor/duration.hpp"
+#include "tailgovernor/clock.hpp"
+#include "tailgovernor/latency.hpp"
+#include "tailgovernor/quantile.hpp"
+#include "tailgovernor/window.hpp"
+#include "tailgovernor/objective.hpp"
+#include "tailgovernor/tail_state.hpp"
+#include "tailgovernor/cause.hpp"
+#include "tailgovernor/intervention.hpp"
+#include "tailgovernor/authority.hpp"
+#include "tailgovernor/evaluation.hpp"
+#include "tailgovernor/governor.hpp"

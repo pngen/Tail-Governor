@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exe
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+
+# Test/persistence scratch
+*.bin
+*.tmp
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# stray
+.cache/
+compile_commands.json
+
+# Python etc
+__pycache__/

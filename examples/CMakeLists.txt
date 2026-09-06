@@ -1,0 +1,8 @@
+add_executable(tg_examples tg_examples.cpp)
+target_link_libraries(tg_examples PRIVATE TailGovernor::tailgovernor)
+if(MSVC)
+    target_compile_options(tg_examples PRIVATE /W4 /WX)
+else()
+    target_compile_options(tg_examples PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME tg_examples COMMAND tg_examples)
