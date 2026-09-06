@@ -7,5 +7,5 @@ else()
 endif()
 
 add_test(NAME tg_distributed
-    COMMAND tailgov_d coordinator ${CMAKE_CURRENT_BINARY_DIR}/dist_state.bin ${CMAKE_CURRENT_BINARY_DIR}/dist_result.txt)
+    COMMAND tailgov_d driver ${CMAKE_CURRENT_BINARY_DIR}/dist_state.bin ${CMAKE_CURRENT_BINARY_DIR}/dist_result.txt)
 

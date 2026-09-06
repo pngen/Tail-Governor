@@ -181,9 +181,12 @@ become current, and survivors must republish fresh evidence before current evalu
 A real multiprocess proof (tailgov_d) uses independent OS processes over framed, versioned,
 CRC-protected TCP loopback. A coordinator/governor process spawns Worker A and Worker B, frames
 are bounded and safe under concurrent writes and partial reads, and the scenarios exercise a real
-worker OS kill, a fresh WorkerBootId fencing out stale traffic, a coordinator restart to
-revalidation, a stale intervention rejecting before dispatch, and a hard-constraint conflict
-resolved to the legal action. All scenarios pass.
+worker OS kill, a fresh WorkerBootId fencing out stale traffic, a genuine OS-process
+coordinator termination and fresh-incarnation restart (the persisted state is reloaded, the
+coordinator epoch advances, recovered observations are REVALIDATION_REQUIRED, surviving
+workers reconnect and republish fresh evidence, and old-epoch/stale traffic rejects), a stale
+intervention rejecting before dispatch, and a hard-constraint conflict resolved to the legal
+action. All scenarios pass.
 
 ## CUDA proof
 
@@ -224,8 +227,10 @@ the CLI execute as tests.
 - The CUDA proof uses a host-side queue-delay tail. GPU-state drift across phases (the 5090 is a
   shared, sometimes-throttled desktop device) means the cross-phase median is not perfectly stable;
   the governed p99 tail and its recovery are the accepted gates, and p50 is reported transparently.
-- ASan is not run under the MSVC toolchain; the Debug configuration builds with MSVC runtime
-  checks (/RTC), which pass cleanly.
+- MSVC AddressSanitizer (/fsanitize=address with the Ninja + cl driver) was run on the core
+  unit/property/adversarial/concurrency suite and on the distributed multiprocess proof; both
+  pass with zero findings. A separate Debug configuration also builds with MSVC runtime checks
+  (/RTC).
 - Tail Governor does not implement admission, batching, preemption, residency, recovery, or
   bandwidth mechanisms; it emits typed intents for adjacent runtimes.
 

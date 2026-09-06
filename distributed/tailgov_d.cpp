@@ -102,7 +102,7 @@ bool recv_frame(SOCKET s, std::vector<std::uint8_t>& payload) {
 
 enum class Msg : std::uint8_t {
     HELLO = 1, LATENCY = 2, INTERVENTION = 3, INTERVENTION_ACK = 4,
-    REPORT = 5, OUTCOME = 6, SHUTDOWN = 7, RESTART = 8
+    REPORT = 5, OUTCOME = 6, SHUTDOWN = 7, RESTART = 8, SET_EPOCH = 9
 };
 
 struct Buf { std::vector<std::uint8_t> v; };
@@ -180,6 +180,9 @@ struct Child {
     HANDLE proc = nullptr;
     DWORD pid = 0;
     ~Child() { if (proc) { TerminateProcess(proc, 0); CloseHandle(proc); } }
+    // Close our handle WITHOUT terminating so an orphaned child survives a
+    // coordinator process termination (used for the coordinator-restart proof).
+    void detach() { if (proc) { CloseHandle(proc); proc = nullptr; } }
 };
 
 bool spawn_worker(const char* name, const char* host, int port, std::uint64_t boot, Child& out) {
@@ -196,49 +199,86 @@ bool spawn_worker(const char* name, const char* host, int port, std::uint64_t bo
     return true;
 }
 
+std::string exe_path() {
+    char e[MAX_PATH]; GetModuleFileNameA(nullptr, e, MAX_PATH);
+    return std::string(e);
+}
+
+bool spawn_cmd(const std::string& cmdline, Child& out) {
+    std::vector<char> cmd(cmdline.begin(), cmdline.end());
+    cmd.push_back('\0');
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    BOOL r = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!r) return false;
+    out.proc = pi.hProcess;
+    out.pid = static_cast<DWORD>(pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+int find_free_port() {
+    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = 0;
+    if (::bind(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) { closesocket(s); return 0; }
+    socklen_t n = sizeof(sa); getsockname(s, reinterpret_cast<sockaddr*>(&sa), &n);
+    int port = ntohs(sa.sin_port);
+    closesocket(s);
+    return port;
+}
+
 int run_worker(const std::string& name, const std::string& host, int port, std::uint64_t boot) {
     Winsock ws; if (!ws.ok()) return 2;
-    Sock s; s.fd = tcp_connect(host, port);
-    if (!s.valid()) { std::fprintf(stderr, "worker %s connect failed\n", name.c_str()); return 1; }
     WorkerId wk = (name == "A") ? WorkerId(100) : WorkerId(200);
-    Buf hello; serialize_hello(hello, name, wk, WorkerBootId(boot), 1);
-    if (!send_msg(s.fd, hello)) return 1;
+    std::uint64_t epoch = 1;
     std::int64_t counter = 0;
+    // Survive a coordinator restart: on connection loss we reconnect and re-register.
     for (;;) {
-        std::vector<std::uint8_t> body;
-        if (!recv_msg(s.fd, body)) return 1;
-        std::uint8_t t = msg_type(body);
-        if (t == static_cast<std::uint8_t>(Msg::SHUTDOWN)) return 0;
-        if (t == static_cast<std::uint8_t>(Msg::REPORT)) {
-            Rd r{body.data() + 1, body.size() - 1, 0, true};
-            std::uint32_t count = r.u32();
-            std::int64_t base = r.i64();
-            std::int64_t qn = r.i64();
-            std::int64_t ex = r.i64();
-            if (count > 100000) return 1;
-            for (std::uint32_t i = 0; i < count; ++i) {
-                RequestLatency lr;
-                lr.request_id = RequestId(static_cast<std::uint64_t>(wk.value()) * 1000000u + static_cast<std::uint64_t>(counter++));
-                lr.request_class = RequestClassId(0);
-                lr.worker = wk; lr.worker_boot = WorkerBootId(boot); lr.epoch = CoordinatorEpoch(1);
-                lr.service_generation = ServiceGeneration(1); lr.workload_generation = WorkloadGeneration(1);
-                lr.arrival_ns = base + static_cast<std::int64_t>(i) * 10;
-                lr.completion_ns = lr.arrival_ns + qn + ex;
-                lr.publication_ns = lr.completion_ns;
-                lr.captured_ns = lr.publication_ns;
-                lr.total_latency = Duration(qn + ex);
-                lr.status = RequestStatus::SUCCESS;
-                lr.retry_count = 0;
-                if (qn > 0) lr.phases.push_back({Phase::QUEUE_WAIT, Duration(qn)});
-                if (ex > 0) lr.phases.push_back({Phase::EXECUTION, Duration(ex)});
-                Buf b; serialize_latency(b, lr);
-                if (!send_msg(s.fd, b)) return 1;
+        Sock s; s.fd = tcp_connect(host, port);
+        if (!s.valid()) { Sleep(50); continue; }
+        Buf hello; serialize_hello(hello, name, wk, WorkerBootId(boot), epoch);
+        if (!send_msg(s.fd, hello)) continue;
+        bool disconnected = false;
+        while (!disconnected) {
+            std::vector<std::uint8_t> body;
+            if (!recv_msg(s.fd, body)) { disconnected = true; break; }
+            std::uint8_t t = msg_type(body);
+            if (t == static_cast<std::uint8_t>(Msg::SHUTDOWN)) return 0;
+            if (t == static_cast<std::uint8_t>(Msg::SET_EPOCH)) {
+                Rd r{body.data() + 1, body.size() - 1, 0, true};
+                epoch = r.u64();
+            } else if (t == static_cast<std::uint8_t>(Msg::REPORT)) {
+                Rd r{body.data() + 1, body.size() - 1, 0, true};
+                std::uint32_t count = r.u32();
+                std::int64_t base = r.i64();
+                std::int64_t qn = r.i64();
+                std::int64_t ex = r.i64();
+                if (count > 100000) { disconnected = true; break; }
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    RequestLatency lr;
+                    lr.request_id = RequestId(static_cast<std::uint64_t>(wk.value()) * 1000000u + static_cast<std::uint64_t>(counter++));
+                    lr.request_class = RequestClassId(0);
+                    lr.worker = wk; lr.worker_boot = WorkerBootId(boot); lr.epoch = CoordinatorEpoch(epoch);
+                    lr.service_generation = ServiceGeneration(1); lr.workload_generation = WorkloadGeneration(1);
+                    lr.arrival_ns = base + static_cast<std::int64_t>(i) * 10;
+                    lr.completion_ns = lr.arrival_ns + qn + ex;
+                    lr.publication_ns = lr.completion_ns;
+                    lr.captured_ns = lr.publication_ns;
+                    lr.total_latency = Duration(qn + ex);
+                    lr.status = RequestStatus::SUCCESS;
+                    lr.retry_count = 0;
+                    if (qn > 0) lr.phases.push_back({Phase::QUEUE_WAIT, Duration(qn)});
+                    if (ex > 0) lr.phases.push_back({Phase::EXECUTION, Duration(ex)});
+                    Buf b; serialize_latency(b, lr);
+                    if (!send_msg(s.fd, b)) { disconnected = true; break; }
+                }
+            } else if (t == static_cast<std::uint8_t>(Msg::INTERVENTION)) {
+                Buf ack; put_u8(ack, static_cast<std::uint8_t>(Msg::INTERVENTION_ACK));
+                if (!send_msg(s.fd, ack)) { disconnected = true; break; }
+            } else {
+                disconnected = true;
             }
-        } else if (t == static_cast<std::uint8_t>(Msg::INTERVENTION)) {
-            Buf ack; put_u8(ack, static_cast<std::uint8_t>(Msg::INTERVENTION_ACK));
-            send_msg(s.fd, ack);
-        } else {
-            return 1;
         }
     }
 }
@@ -373,32 +413,101 @@ bool scenario_c() {
     return !d.is_ok() && d.error().code == StatusCode::STALE_AUTHORITY;
 }
 
-bool scenario_d(const std::string& statefile) {
-    TailGovernor g1 = make_gov();
-    for (int i = 0; i < 200; ++i) {
-        RequestLatency r = mk_stale(WorkerId(200), WorkerBootId(1));
-        r.request_id = RequestId(50000 + i);
-        r.arrival_ns = 1'000'000'000 + static_cast<std::int64_t>(i) * 10;
-        r.completion_ns = r.arrival_ns + 2'000'000; r.publication_ns = r.completion_ns; r.captured_ns = r.publication_ns;
-        r.total_latency = Duration(2'000'000);
-        g1.ingest(r);
-    }
-    if (!g1.save(statefile).ok()) return false;
-    GovernorConfig c; c.clock = std::make_shared<SystemClock>(); c.epoch = CoordinatorEpoch(9);
+// Fresh coordinator incarnation for the genuine OS-process restart (Scenario D).
+// It reloads durable state, advances CoordinatorEpoch, verifies recovered dynamic
+// observations are REVALIDATION_REQUIRED, rejects old-epoch traffic, and requires
+// surviving workers to republish fresh evidence before current evaluation resumes.
+int run_coordinator_resume(int port_arg, const std::string& statefile, const std::string& partialfile, const std::string& finalfile) {
+    Winsock ws; if (!ws.ok()) return 2;
+    GovernorConfig c; c.clock = std::make_shared<SystemClock>(); c.epoch = CoordinatorEpoch(1);
     c.service = ServiceId(1); c.service_generation = ServiceGeneration(1);
     c.workload = WorkloadId(1); c.workload_generation = WorkloadGeneration(1);
-    TailGovernor g2(c);
-    g2.register_worker(WorkerId(200), WorkerBootId(1));
-    if (!g2.load(statefile).ok()) return false;
-    auto ev = g2.evaluate(TailObjectiveId(1));
-    if (!ev.is_ok() || ev->state != TailState::REVALIDATION_REQUIRED) return false;
-    RequestLatency fresh = mk_stale(WorkerId(200), WorkerBootId(1));
-    fresh.request_id = RequestId(60000); fresh.epoch = CoordinatorEpoch(9);
-    fresh.arrival_ns = 9'000'000'000; fresh.completion_ns = 9'000'002'000; fresh.publication_ns = 9'000'002'000; fresh.captured_ns = 9'000'002'000;
-    fresh.total_latency = Duration(2'000'000);
-    if (g2.ingest(fresh).code != StatusCode::OK) return false;
-    auto ev2 = g2.evaluate(TailObjectiveId(1));
-    return ev2.is_ok() && ev2->state != TailState::REVALIDATION_REQUIRED;
+    TailGovernor g(c);
+    if (!g.load(statefile).ok()) return 2;
+    g.advance_epoch();   // fresh incarnation advances CoordinatorEpoch
+    std::uint64_t newEpoch = g.epoch().value();
+
+    SOCKET ls = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) return 2;
+    BOOL reuse = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = htons(static_cast<u_short>(port_arg));
+    if (::bind(ls, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) { closesocket(ls); return 2; }
+    ::listen(ls, 8);
+
+    // Accept the surviving workers (reconnection order is arbitrary), register them.
+    Sock sa_, sb_;
+    auto accept_one = [&](SOCKET& s, HelloInfo& h) { s = ::accept(ls, nullptr, nullptr); if (s == INVALID_SOCKET) return false; return read_hello(s, h); };
+    HelloInfo h1, h2;
+    bool got1 = accept_one(sa_.fd, h1);
+    bool got2 = accept_one(sb_.fd, h2);
+    SOCKET aSock = INVALID_SOCKET, bSock = INVALID_SOCKET;
+    HelloInfo aInfo{}, bInfo{};
+    if (got1) { if (h1.name == "A") { aSock = sa_.fd; aInfo = h1; } else if (h1.name == "B") { bSock = sa_.fd; bInfo = h1; } }
+    if (got2) { if (h2.name == "A") { aSock = sb_.fd; aInfo = h2; } else if (h2.name == "B") { bSock = sb_.fd; bInfo = h2; } }
+    if (aSock != INVALID_SOCKET) g.register_worker(aInfo.wk, aInfo.boot);
+    if (bSock != INVALID_SOCKET) g.register_worker(bInfo.wk, bInfo.boot);
+    bool have_b = bSock != INVALID_SOCKET;
+
+    // Recovered dynamic observations must be in REVALIDATION_REQUIRED before republish.
+    auto evPre = g.evaluate(TailObjectiveId(1));
+    bool revalidation = evPre.is_ok() && evPre->state == TailState::REVALIDATION_REQUIRED;
+
+    // Old-epoch / stale traffic rejects against the advanced coordinator epoch.
+    RequestLatency stale = mk_stale(WorkerId(200), WorkerBootId(1));
+    stale.epoch = CoordinatorEpoch(1);
+    bool staleRejected = (g.ingest(stale).code == StatusCode::STALE_AUTHORITY);
+
+    // Require surviving workers to republish fresh evidence under the new epoch.
+    Buf se; put_u8(se, static_cast<std::uint8_t>(Msg::SET_EPOCH)); put_u64(se, newEpoch);
+    if (aSock != INVALID_SOCKET) send_msg(aSock, se);
+    if (have_b) send_msg(bSock, se);
+    std::uint64_t n = 0;
+    if (aSock != INVALID_SOCKET) n += req_report(aSock, 200, now_ns(), 2'000'000, 2'000'000, g);
+    if (have_b) n += req_report(bSock, 200, now_ns(), 2'000'000, 2'000'000, g);
+    auto evPost = g.evaluate(TailObjectiveId(1));
+    bool resumed = evPost.is_ok() && evPost->state != TailState::REVALIDATION_REQUIRED && n >= 200;
+
+    bool d_pass = revalidation && staleRejected && have_b && resumed;
+
+    std::vector<std::string> all;
+    std::ifstream pf(partialfile);
+    if (pf) { std::string l; while (std::getline(pf, l)) all.push_back(l); }
+    all.push_back("SCENARIO_D_COORDINATOR_RESTART: " + std::string(d_pass ? "PASS" : "FAIL"));
+
+    Buf sh; put_u8(sh, static_cast<std::uint8_t>(Msg::SHUTDOWN));
+    if (aSock != INVALID_SOCKET) send_msg(aSock, sh);
+    if (have_b) send_msg(bSock, sh);
+
+    std::ofstream rf(finalfile, std::ios::trunc);
+    bool all_pass = true;
+    for (const auto& l : all) { std::printf("%s\n", l.c_str()); rf << l << "\n"; if (l.find(": FAIL") != std::string::npos) all_pass = false; }
+    rf.close();
+    closesocket(sa_.fd); closesocket(sb_.fd); closesocket(ls);
+    return all_pass ? 0 : 1;
+}
+
+// Driver: genuinely terminates coordinator incarnation 1 (an OS process) and
+// launches a fresh coordinator incarnation 2, which the surviving workers reconnect to.
+int run_driver(const std::string& statefile, const std::string& finalfile) {
+    Winsock ws; if (!ws.ok()) return 2;
+    int port = find_free_port();
+    if (port <= 0) return 2;
+    std::string partial = statefile + ".partial";
+    std::string exe = exe_path();
+    Child c1;
+    std::string cmd1 = "\"" + exe + "\" coordinator " + std::to_string(port) + " " + statefile + " " + partial;
+    if (!spawn_cmd(cmd1, c1)) return 2;
+    WaitForSingleObject(c1.proc, INFINITE);
+    c1.detach();
+    Child c2;
+    std::string cmd2 = "\"" + exe + "\" coordinator-resume " + std::to_string(port) + " " + statefile + " " + partial + " " + finalfile;
+    if (!spawn_cmd(cmd2, c2)) return 2;
+    WaitForSingleObject(c2.proc, INFINITE);
+    DWORD ec2 = 0; GetExitCodeProcess(c2.proc, &ec2);
+    c2.detach();
+    std::ifstream rf(finalfile);
+    if (rf) { std::string l; while (std::getline(rf, l)) std::printf("%s\n", l.c_str()); }
+    return static_cast<int>(ec2);
 }
 
 bool scenario_e() {
@@ -421,17 +530,17 @@ bool scenario_e() {
     return ev->selected_intervention == InterventionType::ACCELERATE_RECOVERY && ev->binding_hard_constraint.has_value();
 }
 
-int run_coordinator(const std::string& statefile, const std::string& resultfile) {
+int run_coordinator(int port_arg, const std::string& statefile, const std::string& partialfile) {
     Winsock ws; if (!ws.ok()) return 2;
     std::vector<std::string> lines;
     auto record = [&lines](const char* s, bool pass) { lines.push_back(std::string(s) + ": " + (pass ? "PASS" : "FAIL")); };
 
     SOCKET ls = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET) return 2;
-    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = 0;
+    BOOL reuse = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sa.sin_port = htons(static_cast<u_short>(port_arg));
     if (::bind(ls, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) { closesocket(ls); return 2; }
-    socklen_t slen = sizeof(sa);
-    getsockname(ls, reinterpret_cast<sockaddr*>(&sa), &slen);
+    socklen_t slen = sizeof(sa); getsockname(ls, reinterpret_cast<sockaddr*>(&sa), &slen);
     int port = ntohs(sa.sin_port);
     ::listen(ls, 8);
 
@@ -469,30 +578,40 @@ int run_coordinator(const std::string& statefile, const std::string& resultfile)
     }
     record("SCENARIO_B_FRESH_BOOT", fresh);
     record("SCENARIO_C_STALE_INTERVENTION", scenario_c());
-    record("SCENARIO_D_RESTART_REVALIDATION", scenario_d(statefile));
     record("SCENARIO_E_CONFLICTING_ACTION", scenario_e());
 
-    Buf sh; put_u8(sh, static_cast<std::uint8_t>(Msg::SHUTDOWN));
-    if (ok_b) send_msg(bsock.fd, sh);
-    closesocket(asock.fd); closesocket(bsock.fd); closesocket(a2sock.fd); closesocket(ls);
+    // Persist durable coordinator state for the genuine restart that follows.
+    bool saved = g.save(statefile).ok();
+    record("SCENARIO_D_PERSIST_STATE", saved);
 
-    std::ofstream rf(resultfile, std::ios::trunc);
-    bool all_pass = true;
-    for (const auto& l : lines) { std::printf("%s\n", l.c_str()); rf << l << "\n"; if (l.find(": FAIL") != std::string::npos) all_pass = false; }
+    // Coordinate the real coordinator restart: close the listener so a fresh
+    // coordinator incarnation can re-bind the same port, and detach (not terminate)
+    // the surviving workers so they reconnect to that fresh coordinator.
+    closesocket(ls); closesocket(bsock.fd); closesocket(a2sock.fd);
+    b_child.detach(); a2.detach();
+
+    std::ofstream rf(partialfile, std::ios::trunc);
+    for (const auto& l : lines) rf << l << "\n";
     rf.close();
-    return all_pass ? 0 : 1;
+    return 0;   // the driver combines the final result from the resume coordinator
 }
 
 int main(int argc, char** argv) {
     if (argc >= 6 && std::string(argv[1]) == "worker") {
         return run_worker(argv[2], argv[3], std::atoi(argv[4]), std::strtoull(argv[5], nullptr, 10));
     }
-    if (argc >= 3 && std::string(argv[1]) == "coordinator") {
-        std::string state = (argc >= 4) ? argv[3] : "dist_state.bin";
-        std::string result = (argc >= 5) ? argv[4] : "dist_result.txt";
-        return run_coordinator(state, result);
+    if (argc >= 6 && std::string(argv[1]) == "coordinator-resume") {
+        return run_coordinator_resume(std::atoi(argv[2]), argv[3], argv[4], argv[5]);
     }
-    std::fprintf(stderr, "usage: tailgov_d worker <A|B> <host> <port> <boot> | coordinator <state> <result>\n");
+    if (argc >= 5 && std::string(argv[1]) == "coordinator") {
+        return run_coordinator(std::atoi(argv[2]), argv[3], argv[4]);
+    }
+    if (argc >= 3 && std::string(argv[1]) == "driver") {
+        std::string state = (argc >= 3) ? argv[2] : "dist_state.bin";
+        std::string final = (argc >= 4) ? argv[3] : "dist_result.txt";
+        return run_driver(state, final);
+    }
+    std::fprintf(stderr, "usage: tailgov_d worker <A|B> <host> <port> <boot> | coordinator <port> <statefile> <partial> | coordinator-resume <port> <statefile> <partial> <final> | driver <statefile> <final>\n");
     return 2;
 }
 
