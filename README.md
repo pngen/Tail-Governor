@@ -35,9 +35,9 @@ become a general observability system, a general SLO system, an inference schedu
 generic latency runtime. It governs the slow tail.
 
 Adjacent-rung separation is rigorous: Tail Governor consumes a tail-latency objective from
-SLO Fabric, and it emits typed, authority-bearing interventions that adjacent runtimes
+[SLO Fabric](https://github.com/pngen/SLO-Fabric), and it emits typed, authority-bearing interventions that adjacent runtimes
 (Admission Fabric, Batch Fabric, Preemption Fabric, Engine Residency, Recovery Planner, Memory
-Pressure, Bandwidth Governor, Resource Broker) execute. Tail Governor does not implement those
+Pressure, [Bandwidth Governor](https://github.com/pngen/Bandwidth-Governor), [Resource Broker](https://github.com/pngen/Resource-Broker)) execute. Tail Governor does not implement those
 mechanisms. It is not the general execution-cost optimizer (Cost Governor is the next layer).
 
 ## Building and installing
